@@ -1,0 +1,21 @@
+# Add this section to your existing values.yaml
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+# Update ingress section
+ingress:
+  enabled: false  # Set to false initially for testing
+  className: "alb"
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+  hosts:
+    - host: hello-world.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
