@@ -1,53 +1,575 @@
-deploy:
-    needs: test-and-build
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+      - 'feature/**'
+  pull_request:
+    branches: 
+      - main
+      - develop
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: hello-world-app
+  EKS_CLUSTER_NAME: devops-cluster
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+jobs:
+  # Stage 1: Code Quality and Testing
+  lint-and-test:
+    name: Code Quality Checks
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: application/package-lock.json
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_wrapper: false
+      - name: Install dependencies
+        working-directory: ./application
+        run: |
+          echo "📦 Installing dependencies..."
+          npm ci
 
-    - name: Terraform Apply
-      run: |
-        cd terraform
-        terraform init
-        terraform apply -auto-approve
+      - name: Run ESLint
+        working-directory: ./application
+        run: |
+          echo "🔍 Running ESLint..."
+          npm run lint
 
-    - name: Get ECR Repository URL
-      id: get-ecr
-      run: |
-        cd terraform
-        ECR_URL=$(terraform output -raw ecr_repository_url)
-        echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+      - name: Run unit tests with coverage
+        working-directory: ./application
+        run: |
+          echo "🧪 Running unit tests..."
+          npm test -- --coverage --coverageReporters=text --coverageReporters=lcov
 
-    - name: Setup kubectl
-      uses: azure/setup-kubectl@v3
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: ./application/coverage
 
-    - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+      - name: Comment test coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: romeovs/lcov-reporter-action@v0.3.1
+        with:
+          lcov-file: ./application/coverage/lcov.info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Setup Helm
-      uses: azure/setup-helm@v3
+  # Stage 2: Infrastructure Validation
+  terraform-validation:
+    name: Terraform Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Deploy with Helm
-      env:
-        IMAGE_TAG: ${{ github.sha }}
-        ECR_URL: ${{ steps.get-ecr.outputs.ecr_url }}
-      run: |
-        helm upgrade --install hello-world-app ./k8s/helm-charts/hello-world \
-          --set image.tag=$IMAGE_TAG \
-          --set image.repository=$ECR_URL \
-          --wait --timeout=300s
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        id: fmt
+        working-directory: ./terraform
+        run: |
+          echo "🎨 Checking Terraform formatting..."
+          terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Initialize Terraform
+        working-directory: ./terraform
+        run: |
+          echo "🚀 Initializing Terraform..."
+          terraform init -backend=false
+
+      - name: Validate Terraform configuration
+        working-directory: ./terraform
+        run: |
+          echo "✅ Validating Terraform configuration..."
+          terraform validate -no-color
+
+      - name: Run tfsec security scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform
+          soft_fail: true
+
+      - name: Upload tfsec results
+        uses: github/codeql-action/upload-sarif@v2
+        if: success() || failure()
+        with:
+          sarif_file: results.sarif
+
+  # Stage 3: Security Scanning
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, terraform-validation]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run Gemini Security Scan
+        run: |
+          echo "🔐 Running Gemini security scan on Terraform code..."
+          python scripts/gemini-scan.py \
+            --api-key ${{ env.GEMINI_API_KEY }} \
+            --scan-path ./terraform \
+            --output-file security-report.md
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report
+          path: security-report.md
+
+      - name: Comment PR with security report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '## 🔐 Security Scan Report\n\n' + report
+            });
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        if: success() || failure()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Stage 4: Build and Push Docker Image
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: ./application
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.run_number }}
+
+      - name: Run Trivy scan on Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'docker-trivy.sarif'
+
+      - name: Upload Docker scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'docker-trivy.sarif'
+
+  # Stage 5: Deploy Infrastructure
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://hello-world.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Create S3 backend if not exists
+        run: |
+          aws s3api create-bucket \
+            --bucket devops-terraform-state-${{ github.run_id }} \
+            --region ${{ env.AWS_REGION }} || true
+          
+          aws s3api put-bucket-versioning \
+            --bucket devops-terraform-state-${{ github.run_id }} \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-bucket-encryption \
+            --bucket devops-terraform-state-${{ github.run_id }} \
+            --server-side-encryption-configuration '{
+              "Rules": [
+                {
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }
+              ]
+            }'
+
+      - name: Create DynamoDB table for state locking
+        run: |
+          aws dynamodb create-table \
+            --table-name terraform-locks \
+            --attribute-definitions AttributeName=LockID,AttributeType=S \
+            --key-schema AttributeName=LockID,KeyType=HASH \
+            --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 \
+            --region ${{ env.AWS_REGION }} || true
+
+      - name: Initialize Terraform
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=devops-terraform-state-${{ github.run_id }}" \
+            -backend-config="key=infrastructure/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-locks"
+
+      - name: Select or create workspace
+        working-directory: ./terraform
+        run: |
+          terraform workspace select production || terraform workspace new production
+
+      - name: Generate Terraform plan
+        working-directory: ./terraform
+        run: |
+          terraform plan \
+            -var="environment=production" \
+            -var="image_tag=${{ needs.build-and-push.outputs.image-tag }}" \
+            -out=tfplan
+
+      - name: Apply Terraform changes
+        working-directory: ./terraform
+        run: |
+          terraform apply -auto-approve tfplan
+
+      - name: Export Terraform outputs
+        working-directory: ./terraform
+        run: |
+          terraform output -json > ../terraform-outputs.json
+          echo "CLUSTER_NAME=$(terraform output -raw eks_cluster_name)" >> $GITHUB_ENV
+          echo "ECR_REPO=$(terraform output -raw ecr_repository_url)" >> $GITHUB_ENV
+
+      - name: Upload Terraform outputs
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-outputs
+          path: terraform-outputs.json
+
+  # Stage 6: Deploy Application to Kubernetes
+  deploy-application:
+    name: Deploy Application to EKS
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-infrastructure]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://hello-world.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Install Istio
+        run: |
+          echo "📦 Installing Istio service mesh..."
+          curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.19.0 sh -
+          cd istio-*
+          export PATH=$PWD/bin:$PATH
+          istioctl install --set profile=demo -y
+          kubectl label namespace default istio-injection=enabled --overwrite
+
+      - name: Setup Fluentbit for CloudWatch
+        run: |
+          echo "📊 Setting up CloudWatch logging..."
+          kubectl create namespace amazon-cloudwatch || true
+          
+          kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cloudwatch-namespace.yaml
+          
+          kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent-fluent-bit-quickstart.yaml
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Deploy application with Helm
+        run: |
+          echo "🚀 Deploying application to EKS..."
+          helm upgrade --install hello-world ./kubernetes/helm/hello-world \
+            --set image.repository=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ github.sha }} \
+            --set replicaCount=3 \
+            --set environment=production \
+            --set ingress.enabled=true \
+            --create-namespace \
+            --namespace production \
+            --wait \
+            --timeout 10m \
+            --atomic \
+            --debug
+
+      - name: Verify deployment
+        run: |
+          echo "✅ Verifying deployment..."
+          kubectl get pods -n production
+          kubectl get svc -n production
+          kubectl get ingress -n production
+          
+          echo "Waiting for pods to be ready..."
+          kubectl wait --for=condition=ready pod \
+            -l app=hello-world \
+            -n production \
+            --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          echo "🧪 Running smoke tests..."
+          INGRESS_URL=$(kubectl get ingress -n production hello-world -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          for i in {1..30}; do
+            if curl -f http://$INGRESS_URL/health; then
+              echo "Health check passed!"
+              break
+            fi
+            echo "Waiting for application to be ready... (attempt $i/30)"
+            sleep 10
+          done
+          
+          curl -f http://$INGRESS_URL/ || exit 1
+          echo "Smoke tests passed!"
+
+      - name: Send CloudWatch metrics
+        run: |
+          aws cloudwatch put-metric-data \
+            --namespace "Deployments" \
+            --metric-name "SuccessfulDeployments" \
+            --value 1 \
+            --dimensions Environment=production,Application=hello-world
+
+  # Stage 7: Post-deployment tasks
+  post-deployment:
+    name: Post Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [deploy-application]
+    if: success()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CloudWatch Dashboard
+        run: |
+          echo "📈 Creating CloudWatch Dashboard..."
+          aws cloudwatch put-dashboard \
+            --dashboard-name "HelloWorld-Production" \
+            --dashboard-body file://monitoring/cloudwatch-dashboards.json
+
+      - name: Setup CloudWatch Alarms
+        working-directory: ./monitoring
+        run: |
+          echo "🚨 Setting up CloudWatch Alarms..."
+          terraform init
+          terraform apply -auto-approve \
+            -var="project_name=hello-world" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}" \
+            -var="alert_email=${{ secrets.ALERT_EMAIL }}"
+
+      - name: Notify Slack
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            🎉 *Deployment Successful!*
+            • Repository: ${{ github.repository }}
+            • Branch: ${{ github.ref_name }}
+            • Commit: ${{ github.sha }}
+            • Author: ${{ github.actor }}
+            • Message: ${{ github.event.head_commit.message }}
+            • URL: https://hello-world.example.com
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            ## Changes
+            ${{ github.event.head_commit.message }}
+            
+            ## Docker Image
+            - Tag: ${{ github.sha }}
+            - Digest: ${{ needs.build-and-push.outputs.image-digest }}
+            
+            ## Deployment
+            - Environment: Production
+            - Cluster: ${{ env.EKS_CLUSTER_NAME }}
+            - Region: ${{ env.AWS_REGION }}
+          draft: false
+          prerelease: false
+
+  # Rollback job (triggered manually if needed)
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-application]
+    if: failure()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Rollback Helm deployment
+        run: |
+          echo "⏮️ Rolling back deployment..."
+          helm rollback hello-world 0 -n production
+
+      - name: Notify Slack about rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            ⚠️ *Deployment Failed - Rollback Initiated*
+            • Repository: ${{ github.repository }}
+            • Branch: ${{ github.ref_name }}
+            • Commit: ${{ github.sha }}
+            • Author: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+# Workflow for feature branches
+  feature-deployment:
+    name: Deploy Feature Branch
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Extract branch name
+        run: echo "BRANCH_NAME=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
+
+      - name: Deploy to development environment
+        run: |
+          echo "🚀 Deploying feature branch ${{ env.BRANCH_NAME }} to development..."
+          # Add your feature branch deployment logic here
